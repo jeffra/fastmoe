@@ -4,6 +4,7 @@ import time
 import math
 import os, sys
 import itertools
+import deepspeed
 
 import numpy as np
 
@@ -15,6 +16,7 @@ from data_utils import get_lm_corpus
 from mem_transformer import MemTransformerLM
 from utils.exp_utils import create_exp_dir
 from utils.data_parallel import BalancedDataParallel
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 parser = argparse.ArgumentParser(description='PyTorch Transformer Language Model')
 parser.add_argument('--data', type=str, default='../data/wikitext-103',
@@ -147,9 +149,20 @@ parser.add_argument('--moe-num-expert', type=int, default=64,
                     help='number of experts in MoE')
 parser.add_argument('--moe-top-k', type=int, default=2,
                     help='top_k experts in hard gate of moe')
+
+parser.add_argument('--ddp', action='store_true', 
+                    help='use torch ddp instead of data parallel')
+parser.add_argument('--local_rank', type=int, default=-1, help="local gpu rank")
+parser.add_argument('--deepspeed', nargs='?', const=True, default=False,
+                    help="Enable DeepSpeed with auto-generated config with flag and " \
+                    "no argument, or pass an argument to a ds_config json to use.")
+
 args = parser.parse_args()
 args.tied = not args.not_tied
 assert args.moe_num_expert >= args.moe_top_k, "must have moe-num-expert >= moe-top_k"
+
+if args.ddp or args.deepspeed:
+    deepspeed.init_distributed()
 
 if args.d_embed < 0:
     args.d_embed = args.d_model
@@ -183,7 +196,10 @@ if args.fp16:
             print('WARNING: apex not installed, ignoring --fp16 option')
             args.fp16 = False
 
-device = torch.device('cuda' if args.cuda else 'cpu')
+if args.local_rank >= 0:
+    device = torch.device(f'cuda:{args.local_rank}')    
+else:
+    device = torch.device('cuda' if args.cuda else 'cpu')
 
 ###############################################################################
 # Load data
@@ -293,18 +309,25 @@ else:
 args.n_all_param = sum([p.nelement() for p in model.parameters()])
 args.n_nonemb_param = sum([p.nelement() for p in model.layers.parameters()])
 
-if args.fp16:
-    model = model.half()
-
-if args.multi_gpu:
+if args.ddp:
+    deepspeed.init_distributed()
     model = model.to(device)
-    if args.gpu0_bsz >= 0:
-        para_model = BalancedDataParallel(args.gpu0_bsz // args.batch_chunk,
-                                          model, dim=1).to(device)
-    else:
-        para_model = nn.DataParallel(model, dim=1).to(device)
+    if args.fp16:
+        model = model.half()
+    para_model = DDP(model, device_ids=[args.local_rank])
 else:
-    para_model = model.to(device)
+    if args.fp16:
+        model = model.half()
+    
+    if args.multi_gpu:
+        model = model.to(device)
+        if args.gpu0_bsz >= 0:
+            para_model = BalancedDataParallel(args.gpu0_bsz // args.batch_chunk,
+                                              model, dim=1).to(device)
+        else:
+            para_model = nn.DataParallel(model, dim=1).to(device)
+    else:
+        para_model = model.to(device)
 
 #### optimizer
 if args.optim.lower() == 'sgd':
@@ -427,13 +450,26 @@ def evaluate(eval_iter):
 def train():
     # Turn on training mode which enables dropout.
     global train_step, train_loss, best_val_loss, eval_start_time, log_start_time
+
+    ddp = False
+    rank, world_size = 0, 0
+    if torch.distributed.is_initialized():
+        ddp = True
+        world_size = torch.distributed.get_world_size()
+        rank = torch.distributed.get_rank()
+
     model.train()
     if args.batch_chunk > 1:
         mems = [tuple() for _ in range(args.batch_chunk)]
     else:
         mems = tuple()
     train_iter = tr_iter.get_varlen_iter() if args.varlen else tr_iter
+    batch_count = 0
     for batch, (data, target, seq_len) in enumerate(train_iter):
+        batch_count += 1
+        if ddp and (batch_count - 1) % world_size != 0:
+            continue
+    
         model.zero_grad()
         if args.batch_chunk > 1:
             data_chunks = torch.chunk(data, args.batch_chunk, 1)
@@ -485,7 +521,7 @@ def train():
         elif args.scheduler == 'inv_sqrt':
             scheduler.step(train_step)
 
-        if train_step % args.log_interval == 0:
+        if train_step % args.log_interval == 0 and rank == 0:
             cur_loss = train_loss / args.log_interval
             elapsed = time.time() - log_start_time
             log_str = '| epoch {:3d} step {:>8d} | {:>6d} batches | lr {:.3g} ' \
@@ -500,7 +536,7 @@ def train():
             train_loss = 0
             log_start_time = time.time()
 
-        if train_step % args.eval_interval == 0:
+        if train_step % args.eval_interval == 0 and rank == 0:
             val_loss = evaluate(va_iter)
             logging('-' * 100)
             log_str = '| Eval {:3d} at step {:>8d} | time: {:5.2f}s ' \

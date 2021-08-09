@@ -1,8 +1,11 @@
 #!/bin/bash
 
+        #--gpu0_bsz 4 \
+        #--multi_gpu \
+
 if [[ $1 == 'train' ]]; then
     echo 'Run training...'
-    python train.py \
+    deepspeed -i worker-0:0,1,2,3 train.py \
         --cuda \
         --data /vc_data/ammar/data/enwik8/ \
         --dataset enwik8 \
@@ -22,8 +25,8 @@ if [[ $1 == 'train' ]]; then
         --tgt_len 512 \
         --mem_len 512 \
         --eval_tgt_len 128 \
-        --multi_gpu \
-        --batch_size 32 \
+        --batch_size 8 \
+	--ddp \
         ${@:2}
 elif [[ $1 == 'eval' ]]; then
     echo 'Run evaluation...'

@@ -17,15 +17,19 @@ def get_logger(log_path, **kwargs):
     return functools.partial(logging, log_path=log_path, **kwargs)
 
 def create_exp_dir(dir_path, scripts_to_save=None, debug=False):
+    rank = 0
+    if torch.distributed.is_initialized():
+        rank = torch.distributed.get_rank()
+
     if debug:
         print('Debug Mode : no experiment dir created')
         return functools.partial(logging, log_path=None, log_=False)
 
     if not os.path.exists(dir_path):
-        os.makedirs(dir_path)
+        os.makedirs(dir_path, exist_ok=True)
 
     print('Experiment dir : {}'.format(dir_path))
-    if scripts_to_save is not None:
+    if rank == 0 and scripts_to_save is not None:
         script_path = os.path.join(dir_path, 'scripts')
         if not os.path.exists(script_path):
             os.makedirs(script_path)
@@ -33,7 +37,7 @@ def create_exp_dir(dir_path, scripts_to_save=None, debug=False):
             dst_file = os.path.join(dir_path, 'scripts', os.path.basename(script))
             shutil.copyfile(script, dst_file)
 
-    return get_logger(log_path=os.path.join(dir_path, 'log.txt'))
+    return get_logger(log_path=os.path.join(dir_path, f'log-{rank}.txt'))
 
 def save_checkpoint(model, optimizer, path, epoch):
     torch.save(model, os.path.join(path, 'model_{}.pt'.format(epoch)))
